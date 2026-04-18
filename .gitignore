@@ -1,0 +1,56 @@
+# Secrets
+.env
+*.key
+*.pem
+secrets.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.uv/
+*.egg-info/
+dist/
+build/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Data — tracked separately on Zenodo; exclude from git
+data/study.db
+data/plos_cache/
+
+# Archive — old databases and generated reports
+archive/
+
+# Experiment runtime log
+data/experiment.log
+
+# Generated outputs (reproducible from pipeline.R)
+figures/
+tables/
+output/
+analysis/report.pdf
+analysis/report.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code project memory (local only)
+.claude/
+
+# Manuscript and internal design docs (shared separately)
+paper/
+DESIGN.md
+notes/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
