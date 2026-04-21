@@ -83,6 +83,46 @@ wilcox_secondary <- bind_rows(lapply(
   mutate(p_adj = p.adjust(p_raw, method = "bonferroni"),
          p_fmt = fmt_p(p_adj), stars = pstar(p_adj))
 
+wilcox_secondary_pooled <- bind_rows(lapply(
+  c("sentiment_score", "critique_count", "strength_count"),
+  function(outcome) {
+      bind_rows(lapply(c("standard", "aware"), function(ps) {
+        bl <- dat |>
+          filter(
+            prompt_style == ps,
+            direction == "baseline",
+            !is.na(.data[[outcome]])
+          ) |>
+          pull(!!sym(outcome))
+        inj <- dat |>
+          filter(
+            prompt_style == ps,
+            direction == "favorable",
+            !is.na(.data[[outcome]])
+          ) |>
+          pull(!!sym(outcome))
+        if (length(inj) < 3 || length(bl) < 3) {
+          return(NULL)
+        }
+        test <- wilcox.test(inj, bl, exact = FALSE, alternative = "two.sided")
+        data.frame(
+          outcome = outcome,
+          prompt_style = ps,
+          n_inj = length(inj),
+          n_bl = length(bl),
+          W = as.numeric(test$statistic),
+          p_raw = test$p.value,
+          stringsAsFactors = FALSE
+        )
+      }))
+  }
+)) |>
+  mutate(
+    p_adj = p.adjust(p_raw, method = "bonferroni"),
+    p_fmt = fmt_p(p_adj),
+    stars = pstar(p_adj)
+  )
+
 # ── 3. clmm — primary model (H1 and H4) ──────────────────────────────────────
 # model_name added as fixed effect when >1 model present.
 
@@ -204,6 +244,7 @@ if (length(models_in_data) > 1 && !is.null(clmm_place)) {
 stats_out <- list(
   wilcox_primary          = wilcox_primary,
   wilcox_secondary        = wilcox_secondary,
+  wilcox_secondary_pooled = wilcox_secondary_pooled,
   clmm_main               = clmm_main,
   clmm_place              = clmm_place,
   clmm_main_tbl           = clmm_main_tbl,

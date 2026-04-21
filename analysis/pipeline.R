@@ -32,7 +32,8 @@ baseline_per_paper <- dat |>
 injection_per_paper <- dat |>
   filter(direction == "favorable", !is.na(recommendation_ordinal)) |>
   select(paper_id, model_name, prompt_style, placement,
-         injection_ordinal = recommendation_ordinal, injection_rec = recommendation)
+         injection_ordinal = recommendation_ordinal, injection_rec = recommendation,
+         detected_injection)
 
 paired <- inner_join(injection_per_paper, baseline_per_paper,
                      by = c("paper_id", "model_name", "prompt_style")) |>
@@ -48,6 +49,52 @@ paired <- inner_join(injection_per_paper, baseline_per_paper,
     prompt_long = fct_prompt_long(as.character(prompt_style)),
     model_f     = fct_model(model_name)
   )
+
+# ── Detection-compliance analysis ─────────────────────────────────────────────
+# Per-review: does detecting the injection reduce the recommendation shift?
+
+det_compliance <- paired |>
+  filter(!is.na(detected_injection)) |>
+  mutate(det_label = factor(
+    ifelse(detected_injection, "Detected", "Not detected"),
+    levels = c("Not detected", "Detected")
+  ))
+
+det_compliance_summary <- det_compliance |>
+  group_by(prompt_f, det_label) |>
+  summarise(
+    n          = n(),
+    mean_shift = round(mean(shift, na.rm = TRUE), 2),
+    pct_up     = round(100 * mean(shift > 0, na.rm = TRUE)),
+    pct_none   = round(100 * mean(shift == 0, na.rm = TRUE)),
+    pct_down   = round(100 * mean(shift < 0, na.rm = TRUE)),
+    .groups    = "drop"
+  )
+
+# Wilcoxon rank-sum: shift in detected vs not detected (aware prompt only)
+.aw_det   <- det_compliance |>
+  filter(prompt_style == "aware",  detected_injection) |> pull(shift)
+.aw_undet <- det_compliance |>
+  filter(prompt_style == "aware", !detected_injection) |> pull(shift)
+
+det_wilcox_aware <- if (length(.aw_det) >= 3 && length(.aw_undet) >= 3) {
+  .test <- wilcox.test(.aw_det, .aw_undet, exact = FALSE)
+  list(W = as.numeric(.test$statistic), p = .test$p.value,
+       p_fmt = fmt_p(.test$p.value))
+} else {
+  list(W = NA_real_, p = NA_real_, p_fmt = "\u2014")
+}
+
+message(sprintf(
+  "[det-compliance] Aware prompt: detected (n=%d) shift=%.2f, %d%% up | not detected (n=%d) shift=%.2f, %d%% up | Wilcoxon p=%s",
+  sum(det_compliance$prompt_style == "aware" &  det_compliance$detected_injection),
+  mean(.aw_det),
+  round(100 * mean(.aw_det > 0)),
+  sum(det_compliance$prompt_style == "aware" & !det_compliance$detected_injection),
+  mean(.aw_undet),
+  round(100 * mean(.aw_undet > 0)),
+  det_wilcox_aware$p_fmt
+))
 
 # ── Save helpers ──────────────────────────────────────────────────────────────
 
@@ -110,21 +157,31 @@ save_table <- function(dat, name, caption = "", footnotes = character(0),
   finalize_ft(ft, name, caption = caption, footnotes = footnotes)
 }
 
-# Recommendation distribution as formatted text string
-fmt_rec_dist <- function(recs_vec) {
-  labs <- c(REJECT = "Reject", MAJOR_REVISION = "Major",
-            MINOR_REVISION = "Minor", ACCEPT = "Accept")
-  counts <- table(factor(as.character(recs_vec),
-                         levels = names(labs)))
-  n_total <- sum(counts)
-  parts <- character(0)
-  for (cat in names(labs)) {
-    if (!is.na(counts[cat]) && counts[cat] > 0)
-      parts <- c(parts,
-                 sprintf("%s %d (%d%%)", labs[cat], counts[cat],
-                         round(100 * counts[cat] / n_total)))
+# ── Metric pivot helper ─────────────────────────────────────────────────────
+# Shared prep for secondary outcomes (F4) and psycholinguistic dimensions (F_psycholing).
+
+pivot_metrics <- function(dat, cols, labels, count_labels = character(0),
+                          by_paper = FALSE) {
+  out <- dat |>
+    mutate(prompt_f  = fct_prompt(as.character(prompt_style)),
+           model_f   = fct_model(model_name),
+           dir_label = factor(ifelse(direction == "baseline", "Baseline", "Injection"),
+                              levels = c("Baseline", "Injection")))
+  if (by_paper) {
+    out <- out |>
+      group_by(paper_id, prompt_f, model_f, dir_label) |>
+      summarise(across(all_of(cols), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
   }
-  paste(parts, collapse = "; ")
+  out |>
+    pivot_longer(cols = all_of(cols), names_to = "metric", values_to = "value") |>
+    filter(!is.na(value)) |>
+    mutate(metric   = factor(metric, levels = names(labels), labels = labels),
+           is_count = metric %in% count_labels)
+}
+
+# Test whether a formatted p-value string represents significance at α = 0.05
+is_sig_p <- function(p_str) {
+  p_str == "<0.001" | suppressWarnings(as.numeric(p_str)) < 0.05
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -202,19 +259,18 @@ rec_agg <- dat |>
   mutate(ci_lo = mean_ord - 1.96 * se,
          ci_hi = mean_ord + 1.96 * se)
 
-wilcox_pooled <- bind_rows(lapply(unique(dat$model_name), function(mn) {
-  bind_rows(lapply(c("standard", "aware"), function(ps) {
-    bl  <- dat |> filter(model_name == mn, prompt_style == ps, direction == "baseline",
-                         !is.na(recommendation_ordinal)) |> pull(recommendation_ordinal)
-    inj <- dat |> filter(model_name == mn, prompt_style == ps, direction == "favorable",
-                         !is.na(recommendation_ordinal)) |> pull(recommendation_ordinal)
-    if (length(bl) < 3 || length(inj) < 3) return(NULL)
-    test <- wilcox.test(inj, bl, exact = FALSE)
-    data.frame(model_f = fct_model(mn), prompt_f = fct_prompt(ps),
-               p_raw = test$p.value, stars = pstar(test$p.value),
-               stringsAsFactors = FALSE)
-  }))
-}))
+wilcox_pooled <- dat |>
+  filter(!is.na(recommendation_ordinal)) |>
+  mutate(model_f = fct_model(model_name), prompt_f = fct_prompt(prompt_style)) |>
+  group_by(model_f, prompt_f) |>
+  summarise(
+    p_raw = wilcox.test(
+      recommendation_ordinal[direction == "favorable"],
+      recommendation_ordinal[direction == "baseline"],
+      exact = FALSE)$p.value,
+    .groups = "drop"
+  ) |>
+  mutate(stars = pstar(p_raw))
 
 f2_dw <- 0.55
 
@@ -288,23 +344,19 @@ det_agg <- dat |>
     ci_hi = ifelse(detected == n, 1, qbeta(0.975, detected + 1, n - detected))
   )
 
-# Fisher exact test: injection vs baseline detection rate per model × prompt.
-det_stars_f3 <- bind_rows(lapply(unique(dat$model_name), function(mn) {
-  bind_rows(lapply(c("standard", "aware"), function(ps) {
-    bl  <- dat |> filter(model_name == mn, prompt_style == ps,
-                         direction == "baseline",  !is.na(detected_injection))
-    inj <- dat |> filter(model_name == mn, prompt_style == ps,
-                         direction == "favorable", !is.na(detected_injection))
-    if (nrow(bl) < 3 || nrow(inj) < 3) return(NULL)
-    tbl  <- matrix(
-      c(sum(inj$detected_injection),  nrow(inj) - sum(inj$detected_injection),
-        sum(bl$detected_injection),   nrow(bl)  - sum(bl$detected_injection)),
-      nrow = 2, byrow = TRUE)
-    test <- fisher.test(tbl)
-    data.frame(model_f = fct_model(mn), prompt_f = fct_prompt(ps),
-               stars = pstar(test$p.value), stringsAsFactors = FALSE)
-  }))
-}))
+# Fisher exact test: injection vs baseline detection rate per model × prompt
+det_stars_f3 <- dat |>
+  filter(!is.na(detected_injection)) |>
+  mutate(model_f = fct_model(model_name), prompt_f = fct_prompt(prompt_style)) |>
+  group_by(model_f, prompt_f) |>
+  summarise(
+    p_raw = fisher.test(table(
+      factor(direction, levels = c("favorable", "baseline")),
+      factor(detected_injection, levels = c(TRUE, FALSE))
+    ))$p.value,
+    .groups = "drop"
+  ) |>
+  mutate(stars = pstar(p_raw))
 
 star_dat_f3 <- det_agg |>
   left_join(det_stars_f3 |> select(model_f, prompt_f, stars),
@@ -379,24 +431,10 @@ PROMPT_LONG_COLORS <- setNames(
   levels(fct_prompt_long("standard"))
 )
 
-# Pooled Wilcoxon across models (pair by paper_id × model_name)
-wilcox_place_pooled <- bind_rows(lapply(c("standard", "aware"), function(ps) {
-  bl_df <- dat |>
-    filter(prompt_style == ps, direction == "baseline",
-           !is.na(recommendation_ordinal)) |>
-    select(paper_id, model_name, bl_ord = recommendation_ordinal)
-  bind_rows(lapply(c("beginning", "middle", "end"), function(pl) {
-    inj_df <- dat |>
-      filter(prompt_style == ps, direction == "favorable",
-             placement == pl, !is.na(recommendation_ordinal)) |>
-      select(paper_id, model_name, inj_ord = recommendation_ordinal)
-    paired_df <- inner_join(bl_df, inj_df, by = c("paper_id", "model_name"))
-    if (nrow(paired_df) < 3) return(NULL)
-    test <- wilcox.test(paired_df$inj_ord, paired_df$bl_ord,
-                        paired = TRUE, exact = FALSE)
-    data.frame(prompt_style = ps, placement = pl, p_raw = test$p.value)
-  }))
-})) |>
+# Paired Wilcoxon on shift, pooled across models, per prompt × placement
+wilcox_place_pooled <- paired |>
+  group_by(prompt_style, placement) |>
+  summarise(p_raw = wilcox.test(shift, exact = FALSE)$p.value, .groups = "drop") |>
   group_by(prompt_style) |>
   mutate(p_adj = p.adjust(p_raw, "bonferroni"), stars = pstar(p_adj)) |>
   ungroup()
@@ -415,13 +453,6 @@ place_agg <- dat |>
   ) |>
   mutate(ci_lo = mean_ord - 1.96 * se,
          ci_hi = mean_ord + 1.96 * se)
-
-star_place <- wilcox_place_pooled |>
-  mutate(
-    prompt_long = fct_prompt_long(prompt_style),
-    condition_p = fct_condition("favorable", placement)
-  ) |>
-  select(prompt_long, condition_p, stars)
 
 fp_dw <- 0.25
 
@@ -461,37 +492,23 @@ det_place_agg <- dat |>
                    qbeta(0.975, detected + 1, n - detected))
   )
 
-# Fisher's exact test: each injection placement vs. baseline, per prompt style
-fisher_det_place <- bind_rows(lapply(
-  levels(det_place_agg$prompt_long),
-  function(pl_long) {
-    bl_row <- det_place_agg |>
-      filter(as.character(prompt_long) == pl_long,
-             as.character(condition_p) == "Baseline")
-    bind_rows(lapply(c("Beginning", "Middle", "End"), function(cond) {
-      inj_row <- det_place_agg |>
-        filter(as.character(prompt_long) == pl_long,
-               as.character(condition_p) == cond)
-      if (nrow(inj_row) == 0 || nrow(bl_row) == 0) return(NULL)
-      mat <- matrix(
-        c(inj_row$detected, inj_row$n - inj_row$detected,
-          bl_row$detected,  bl_row$n  - bl_row$detected),
-        nrow = 2
-      )
-      p <- tryCatch(fisher.test(mat)$p.value, error = function(e) NA_real_)
-      data.frame(
-        prompt_long = factor(pl_long, levels = levels(det_place_agg$prompt_long)),
-        condition_p = factor(cond, levels = levels(det_place_agg$condition_p)),
-        p_raw = p, stringsAsFactors = FALSE
-      )
-    }))
-  }
-)) |>
+# Fisher exact test: each injection placement vs baseline, per prompt style
+bl_det <- det_place_agg |>
+  filter(condition_p == "Baseline") |>
+  select(prompt_long, bl_detected = detected, bl_n = n)
+
+fisher_det_place <- det_place_agg |>
+  filter(condition_p != "Baseline") |>
+  left_join(bl_det, by = "prompt_long") |>
+  rowwise() |>
+  mutate(p_raw = fisher.test(matrix(
+    c(detected, n - detected, bl_detected, bl_n - bl_detected), nrow = 2
+  ))$p.value) |>
+  ungroup() |>
   mutate(p_adj = p.adjust(p_raw, "bonferroni"), stars = pstar(p_adj))
 
-star_det_place <- det_place_agg |>
-  left_join(fisher_det_place, by = c("prompt_long", "condition_p")) |>
-  filter(condition_p != "Baseline", replace_na(stars, "") != "")
+star_det_place <- fisher_det_place |>
+  filter(replace_na(stars, "") != "")
 
 Fp_det <- ggplot(
     det_place_agg,
@@ -540,81 +557,25 @@ secondary_labels <- c(
   positive_affect = "Positive affect"
 )
 
-secondary_long <- dat |>
-  mutate(prompt_f  = fct_prompt(as.character(prompt_style)),
-         model_f   = fct_model(model_name),
-         dir_label = factor(ifelse(direction == "baseline", "Baseline", "Injection"),
-                            levels = c("Baseline", "Injection"))) |>
-  pivot_longer(cols = all_of(secondary_cols),
-               names_to = "metric", values_to = "value") |>
-  filter(!is.na(value)) |>
-  mutate(metric    = factor(metric,
-                            levels = secondary_cols,
-                            labels = secondary_labels[secondary_cols]),
-         is_count  = metric %in% c("Critiques (n)", "Strengths (n)"))
+sec_labels <- secondary_labels[secondary_cols]
+sec_count  <- c("Critiques (n)", "Strengths (n)")
+
+secondary_long <- pivot_metrics(dat, secondary_cols, sec_labels, sec_count)
 
 # Per-paper means for dot overlay (paper is the unit of analysis in clmm;
 # injection conditions averaged across placements to avoid triplication).
-secondary_paper_means <- dat |>
-  mutate(prompt_f  = fct_prompt(as.character(prompt_style)),
-         model_f   = fct_model(model_name),
-         dir_label = factor(ifelse(direction == "baseline", "Baseline", "Injection"),
-                            levels = c("Baseline", "Injection"))) |>
-  group_by(paper_id, prompt_f, model_f, dir_label) |>
-  summarise(across(all_of(secondary_cols), \(x) mean(x, na.rm = TRUE)),
-            .groups = "drop") |>
-  pivot_longer(cols = all_of(secondary_cols), names_to = "metric", values_to = "value") |>
-  filter(!is.na(value)) |>
-  mutate(metric   = factor(metric, levels = secondary_cols,
-                           labels = secondary_labels[secondary_cols]),
-         is_count = metric %in% c("Critiques (n)", "Strengths (n)"))
+secondary_paper_means <- pivot_metrics(dat, secondary_cols, sec_labels, sec_count,
+                                       by_paper = TRUE)
 
-dodge_w <- 0.55
-
-# y_pos: range-relative offset so it works for both counts and probabilities.
-# scale_y_continuous below adds 18 % headroom above max to guarantee clearance.
-metric_ymax <- secondary_long |>
-  group_by(metric) |>
-  summarise(
-    y_pos = max(value, na.rm = TRUE) + 0.10 * diff(range(value, na.rm = TRUE)),
-    .groups = "drop"
-  )
-
-# DEPRECATED, USED TO GO WITH THE BOXPLOT AND POINTS VERSION
-# sig_f4 <- secondary_long |>
-#   group_by(prompt_f, metric) |>
-#   summarise(
-#     pval  = wilcox.test(value[dir_label == "Baseline"],
-#                         value[dir_label == "Injection"],
-#                         exact = FALSE)$p.value,
-#     .groups = "drop"
-#   ) |>
-#   left_join(metric_ymax, by = "metric") |>
-#   mutate(label = case_when(pval < 0.001 ~ "***", pval < 0.01 ~ "**",
-#                            pval < 0.05 ~ "*", TRUE ~ "ns"),
-#          x_mid = as.numeric(prompt_f))
-
-sig_f4 <- secondary_long |>
-  group_by(prompt_f, metric) |>
-  summarise(
-    pval = wilcox.test(
-      value[dir_label == "Baseline"],
-      value[dir_label == "Injection"],
-      exact = FALSE
-    )$p.value,
-    mean_inj = mean(value[dir_label == "Injection"], na.rm = TRUE),
-    se_inj = sd(value[dir_label == "Injection"], na.rm = TRUE) /
-      sqrt(sum(dir_label == "Injection")),
-    .groups = "drop"
-  ) |>
+sig_f4 <- stats_out$wilcox_secondary |>
   mutate(
-    label = case_when(
-      pval < 0.001 ~ "***",
-      pval < 0.01 ~ "**",
-      pval < 0.05 ~ "*",
-      TRUE ~ "ns"
-    ),
-    x_mid = as.numeric(prompt_f)
+    prompt_f = fct_prompt(prompt_style),
+    model_f  = fct_model(model_name),
+    metric   = factor(outcome, levels = secondary_cols,
+                      labels = secondary_labels[secondary_cols]),
+    label    = case_when(p_adj < 0.001 ~ "***", p_adj < 0.01 ~ "**",
+                         p_adj < 0.05 ~ "*", TRUE ~ "ns"),
+    x_mid    = as.numeric(prompt_f)
   )
 
 f4_titles <- c(
@@ -622,61 +583,6 @@ f4_titles <- c(
   critique_count  = "Critiques",
   strength_count  = "Strengths"
 )
-
-make_f4_panel <- function(mdat, mdat_pts, msig, title) {
-  is_cnt <- isTRUE(unique(mdat$is_count)[1])
-  ylab   <- if (is_cnt) "Count (n)" else "Score (0\u20131)"
-  jpos   <- position_jitterdodge(
-    jitter.width  = 0.14,
-    dodge.width   = dodge_w,
-    jitter.height = if (is_cnt) 0.15 else 0
-  )
-
-  ggplot(mdat, aes(x = prompt_f, y = value, fill = dir_label)) +
-    geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.45, linewidth = 0.4,
-                 position = position_dodge(dodge_w)) +
-    geom_point(data = mdat_pts, aes(color = dir_label, shape = model_f),
-               position = jpos, size = 1.5, alpha = 0.55) +
-    geom_text(data = msig, aes(x = x_mid, y = y_pos, label = label),
-              inherit.aes = FALSE, size = 3.8, color = "#333333", vjust = 0) +
-    scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
-    scale_fill_manual(values = c(Baseline = "#BBBBBB", Injection = "#2166AC")) +
-    scale_color_manual(values = c(Baseline = "#888888", Injection = "#2166AC"),
-                       guide = "none") +
-    scale_shape_manual(values = c("Gemma 4 (26B)" = 16, "GPT o4-mini" = 17,
-                                  "Claude Sonnet" = 15)) +
-    labs(x = NULL, y = ylab, fill = "Condition", shape = "Model", title = title)
-}
-
-# DEPRECATED, OLD BOXPLOT + POINTS VERSION
-# make_f4_panel <- function(mdat, mdat_pts, msig, title) {
-#   is_cnt <- isTRUE(unique(mdat$is_count)[1])
-#   ylab   <- if (is_cnt) "Count (n)" else "Score (0\u201310)"
-
-#   agg <- mdat |>
-#     group_by(prompt_f, dir_label) |>
-#     summarise(
-#       mean_val = mean(value, na.rm = TRUE),
-#       se       = sd(value, na.rm = TRUE) / sqrt(n()),
-#       .groups  = "drop"
-#     ) |>
-#     mutate(ci_lo = mean_val - 1.96 * se,
-#            ci_hi = mean_val + 1.96 * se)
-
-#   ggplot(agg, aes(x = as.integer(prompt_f), y = mean_val,
-#                   ymin = ci_lo, ymax = ci_hi,
-#                   color = dir_label,
-#                   group = dir_label)) +
-#     geom_pointrange(position = position_dodge(width = 0.4),
-#                     linewidth = 0.6, size = 0.45) +
-#     geom_text(data = msig, aes(x = x_mid, y = y_pos, label = label),
-#               inherit.aes = FALSE, size = 3.8, color = "#333333", vjust = 0) +
-#     scale_x_continuous(breaks = seq_len(nlevels(agg$prompt_f)),
-#                        labels = levels(agg$prompt_f)) +
-#     scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
-#     scale_color_manual(values = c(Baseline = "#888888", Injection = "#2166AC")) +
-#     labs(x = NULL, y = ylab, color = "Condition", title = title)
-# }
 
 make_f4_panel <- function(mdat, mdat_pts, msig, title, ylab = NULL, star_offset = 0.15, star_floor = 0.02) {
   is_cnt <- isTRUE(unique(mdat$is_count)[1])
@@ -714,7 +620,7 @@ y_ceil <- agg |>
   summarise(y_ceil = max(ci_hi, na.rm = TRUE), .groups = "drop")
 
 star_agg <- agg |>
-  left_join(msig |> select(prompt_f, label), by = "prompt_f") |>
+  left_join(msig |> select(prompt_f, model_f, label), by = c("prompt_f", "model_f")) |>
   left_join(y_ceil, by = c("prompt_f", "model_f")) |>
   mutate(
     star_label = ifelse(dir_label == "Injection", label, ""),
@@ -814,49 +720,19 @@ if (has_psycholing) {
   )
   psycholing_cols_present <- intersect(names(psycholing_labels), names(dat))
 
-  psycholing_long <- dat |>
-    mutate(prompt_f  = fct_prompt(as.character(prompt_style)),
-           model_f   = fct_model(model_name),
-           dir_label = factor(ifelse(direction == "baseline", "Baseline", "Injection"),
-                              levels = c("Baseline", "Injection"))) |>
-    pivot_longer(cols = all_of(psycholing_cols_present),
-                 names_to = "metric", values_to = "value") |>
-    filter(!is.na(value)) |>
-    mutate(metric   = factor(metric,
-                             levels = names(psycholing_labels),
-                             labels = psycholing_labels[names(psycholing_labels)]),
-           is_count = FALSE)
+  psycholing_long <- pivot_metrics(dat, psycholing_cols_present, psycholing_labels)
 
-  psycholing_paper_means <- dat |>
-    mutate(prompt_f  = fct_prompt(as.character(prompt_style)),
-           model_f   = fct_model(model_name),
-           dir_label = factor(ifelse(direction == "baseline", "Baseline", "Injection"),
-                              levels = c("Baseline", "Injection"))) |>
-    group_by(paper_id, prompt_f, model_f, dir_label) |>
-    summarise(across(all_of(psycholing_cols_present), \(x) mean(x, na.rm = TRUE)),
-              .groups = "drop") |>
-    pivot_longer(cols = all_of(psycholing_cols_present),
-                 names_to = "metric", values_to = "value") |>
-    filter(!is.na(value)) |>
-    mutate(metric   = factor(metric,
-                             levels = names(psycholing_labels),
-                             labels = psycholing_labels[names(psycholing_labels)]),
-           is_count = FALSE)
-
-  psy_ymax <- psycholing_long |>
-    group_by(metric) |>
-    summarise(y_pos = max(value, na.rm = TRUE) +
-                0.10 * diff(range(value, na.rm = TRUE)), .groups = "drop")
+  psycholing_paper_means <- pivot_metrics(dat, psycholing_cols_present, psycholing_labels,
+                                          by_paper = TRUE)
 
   sig_psy <- psycholing_long |>
-    group_by(prompt_f, metric) |>
+    group_by(prompt_f, model_f, metric) |>
     summarise(
       pval = wilcox.test(value[dir_label == "Baseline"],
                          value[dir_label == "Injection"],
                          exact = FALSE)$p.value,
       .groups = "drop"
     ) |>
-    left_join(psy_ymax, by = "metric") |>
     mutate(label = case_when(pval < 0.001 ~ "***", pval < 0.01 ~ "**",
                              pval < 0.05 ~ "*", TRUE ~ "ns"),
            x_mid = as.numeric(prompt_f))
@@ -887,14 +763,6 @@ if (has_psycholing) {
 if (requireNamespace("ggalluvial", quietly = TRUE)) {
   library(ggalluvial)
 
-  # Two-line labels keep text within stratum boxes
-  REC_LABELS_2L <- c(
-    REJECT         = "Reject",
-    MAJOR_REVISION = "Major\nrev.",
-    MINOR_REVISION = "Minor\nrev.",
-    ACCEPT         = "Accept"
-  )
-
   alluvial_dat <- paired |>
     count(prompt_long, baseline_rec, injection_rec) |>
     mutate(baseline_rec  = factor(baseline_rec,  levels = names(REC_COLORS)),
@@ -905,17 +773,14 @@ if (requireNamespace("ggalluvial", quietly = TRUE)) {
       ggplot(aes(axis1 = baseline_rec, axis2 = injection_rec, y = n)) +
       geom_alluvium(aes(fill = baseline_rec), alpha = 0.60, width = 0.32, knot.pos = 1/3) +
       geom_stratum(aes(fill = after_stat(stratum)), width = 0.32,
-                   color = "white", linewidth = 0.7) +
-      geom_text(stat = "stratum",
-                aes(label = after_stat(ifelse(n >= 15,
-                  dplyr::case_when(
-                    as.character(stratum) == "REJECT"         ~ "Reject",
-                    as.character(stratum) == "MAJOR_REVISION" ~ "Major\nrev.",
-                    as.character(stratum) == "MINOR_REVISION" ~ "Minor\nrev.",
-                    as.character(stratum) == "ACCEPT"         ~ "Accept",
-                    TRUE ~ ""
-                  ), ""))),
-                size = 2.5, color = "white", fontface = "bold", lineheight = 0.85) +
+                   color = "white", linewidth = 0.3) +
+geom_text(stat = "stratum",
+          aes(label = after_stat({
+            tot <- tapply(count, x, sum)
+            pct <- round(100 * count / tot[as.character(x)])
+            ifelse(count >= 15, paste0(pct, "%"), "")
+          })),
+          size = 2.5, color = "white", fontface = "bold", lineheight = 0.85)+
       scale_fill_manual(values = REC_COLORS, labels = REC_LABELS, name = "") +
       scale_x_discrete(limits = c("Baseline", "Injection"), expand = c(0.15, 0.15)) +
       labs(x = NULL, y = "Reviews (n)", title = title) +
@@ -971,49 +836,10 @@ save_table(shift_tbl, "T6_shift_summary",
 # ── T_text_stats: Inline text statistics for manuscript ───────────────────────
 # Key-value CSV used to fill in all inline numbers in the paper draft.
 
-.scalar_stats <- tibble::tibble(
-  key   = c("n_papers", "n_reviews", "n_extractions_with_rec", "pct_extractions_complete",
-            "baseline_mean_overall"),
-  value = c(
-    as.numeric(n_distinct(dat$paper_id)),
-    as.numeric(nrow(dat)),
-    as.numeric(sum(!is.na(dat$recommendation_ordinal))),
-    round(100 * mean(!is.na(dat$recommendation_ordinal)), 1),
-    round(mean(dat$recommendation_ordinal[dat$direction == "baseline"], na.rm = TRUE), 2)
-  )
-)
+writeLines(R.version.string, here("output", "r_version.txt"))
 
-writeLines(R.version.string,
-           here("output", "r_version.txt"))
-
-.corpus_counts <- dat |>
-  distinct(paper_id, study_type) |>
-  dplyr::count(study_type) |>
-  mutate(key = paste0("n_papers_", study_type)) |>
-  select(key, value = n) |>
-  mutate(value = as.numeric(value))
-
-.det_rates <- dat |>
-  group_by(prompt_style, placement) |>
-  summarise(
-    n        = n(),
-    detected = sum(detected_injection, na.rm = TRUE),
-    pct      = round(100 * mean(detected_injection, na.rm = TRUE), 1),
-    .groups  = "drop"
-  ) |>
-  mutate(key = sprintf("detection_pct_%s_%s", prompt_style, placement)) |>
-  select(key, value = pct) |>
-  mutate(value = as.numeric(value))
-
-.bl_means <- dat |>
-  filter(direction == "baseline", !is.na(recommendation_ordinal)) |>
-  group_by(model_name) |>
-  summarise(mean_ord = round(mean(recommendation_ordinal), 2), .groups = "drop") |>
-  mutate(key = paste0("baseline_mean_", gsub("[^a-zA-Z0-9]", "_", model_name))) |>
-  select(key, value = mean_ord) |>
-  mutate(value = as.numeric(value))
-
-.alluvial_stats <- paired |>
+# Alluvial shift stats (needed for top-transition percentage below)
+alluvial_stats <- paired |>
   group_by(prompt_f) |>
   summarise(
     n_total  = n(),
@@ -1023,64 +849,76 @@ writeLines(R.version.string,
     .groups  = "drop"
   ) |>
   mutate(ps = ifelse(as.character(prompt_f) == "Standard", "std", "aw")) |>
-  pivot_longer(cols = c(n_total, pct_up, pct_same, pct_down),
+  pivot_longer(c(n_total, pct_up, pct_same, pct_down),
                names_to = "metric", values_to = "value") |>
-  mutate(key = paste0("alluvial_", ps, "_", metric)) |>
-  select(key, value) |>
-  mutate(value = as.numeric(value))
+  transmute(key = paste0("alluvial_", ps, "_", metric), value)
 
-# Most common transition per prompt style
-.alluvial_top <- paired |>
-  group_by(prompt_f, baseline_rec, injection_rec) |>
-  summarise(n = n(), .groups = "drop") |>
-  group_by(prompt_f) |>
-  slice_max(n, n = 1, with_ties = FALSE) |>
-  ungroup() |>
-  mutate(
-    ps = ifelse(as.character(prompt_f) == "Standard", "std", "aw"),
-    pct = round(100 * n / sum(.alluvial_stats$value[.alluvial_stats$key == paste0("alluvial_", ps, "_n_total")]), 1)
-  ) |>
-  pivot_longer(cols = c(n, pct), names_to = "metric", values_to = "value") |>
-  mutate(
-    key = paste0("alluvial_", ps, "_top_transition_", metric),
-    value = as.numeric(value)
-  ) |>
-  select(key, value)
-
-# Residual injection OR under aware prompt (exp(beta_inj + beta_interaction))
-.residual_OR_stat <- if (!is.null(stats_out$clmm_main)) {
-  cf <- summary(stats_out$clmm_main)$coefficients
-  beta_inj   <- cf["directionfavorable", "Estimate"]
-  beta_inter <- cf["directionfavorable:prompt_styleaware", "Estimate"]
-  tibble::tibble(key = "residual_OR_injection_under_aware",
-                 value = round(exp(beta_inj + beta_inter), 2))
-} else {
-  tibble::tibble(key = "residual_OR_injection_under_aware", value = NA_real_)
-}
-
-# LRT placement × model interaction
-.lrt_stat <- if (!is.null(stats_out$lrt_place_model)) {
-  lrt_row <- stats_out$lrt_place_model[2, ]
-  tibble::tibble(
-    key   = c("lrt_placement_model_chisq", "lrt_placement_model_df",
-              "lrt_placement_model_p"),
-    value = c(
-      round(tryCatch(lrt_row[["LR.stat"]], error = function(e) NA_real_), 2),
-      as.numeric(tryCatch(lrt_row[["df"]],           error = function(e) NA_real_)),
-      as.numeric(tryCatch(lrt_row[["Pr(>Chisq)"]],   error = function(e) NA_real_))
-    )
-  )
-} else {
-  tibble::tibble(
-    key   = c("lrt_placement_model_chisq", "lrt_placement_model_df",
-              "lrt_placement_model_p"),
-    value = NA_real_
-  )
-}
+# Detection-compliance summary (aware prompt)
+aw_det_sum   <- det_compliance_summary |> filter(prompt_f == "Aware", det_label == "Detected")
+aw_undet_sum <- det_compliance_summary |> filter(prompt_f == "Aware", det_label == "Not detected")
 
 text_stats <- bind_rows(
-  .scalar_stats, .corpus_counts, .det_rates, .bl_means,
-  .alluvial_stats, .alluvial_top, .residual_OR_stat, .lrt_stat
+  # Scalar dataset stats
+  tibble(
+    key   = c("n_papers", "n_reviews", "n_extractions_with_rec",
+              "pct_extractions_complete", "baseline_mean_overall"),
+    value = c(n_distinct(dat$paper_id), nrow(dat),
+              sum(!is.na(dat$recommendation_ordinal)),
+              round(100 * mean(!is.na(dat$recommendation_ordinal)), 1),
+              round(mean(dat$recommendation_ordinal[dat$direction == "baseline"], na.rm = TRUE), 2))
+  ),
+  # Corpus counts by study type
+  dat |> distinct(paper_id, study_type) |> count(study_type) |>
+    transmute(key = paste0("n_papers_", study_type), value = as.numeric(n)),
+  # Baseline mean per model
+  dat |> filter(direction == "baseline", !is.na(recommendation_ordinal)) |>
+    group_by(model_name) |>
+    summarise(value = round(mean(recommendation_ordinal), 2), .groups = "drop") |>
+    transmute(key = paste0("baseline_mean_", gsub("[^a-zA-Z0-9]", "_", model_name)), value),
+  # Detection rates per prompt × placement
+  dat |> group_by(prompt_style, placement) |>
+    summarise(value = round(100 * mean(detected_injection, na.rm = TRUE), 1), .groups = "drop") |>
+    transmute(key = sprintf("detection_pct_%s_%s", prompt_style, placement), value),
+  # Alluvial shift stats
+  alluvial_stats,
+  # Most common transition per prompt style
+  paired |>
+    group_by(prompt_f, baseline_rec, injection_rec) |>
+    summarise(n = n(), .groups = "drop") |>
+    group_by(prompt_f) |>
+    slice_max(n, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    mutate(
+      ps      = ifelse(as.character(prompt_f) == "Standard", "std", "aw"),
+      n_total = alluvial_stats$value[match(paste0("alluvial_", ps, "_n_total"), alluvial_stats$key)],
+      pct     = round(100 * n / n_total, 1)
+    ) |>
+    pivot_longer(c(n, pct), names_to = "metric", values_to = "value") |>
+    transmute(key = paste0("alluvial_", ps, "_top_transition_", metric), value),
+  # Residual injection OR under aware prompt
+  if (!is.null(stats_out$clmm_main)) {
+    cf <- summary(stats_out$clmm_main)$coefficients
+    tibble(key = "residual_OR_injection_under_aware",
+           value = round(exp(cf["directionfavorable", "Estimate"] +
+                             cf["directionfavorable:prompt_styleaware", "Estimate"]), 2))
+  } else tibble(key = "residual_OR_injection_under_aware", value = NA_real_),
+  # LRT placement × model interaction
+  if (!is.null(stats_out$lrt_place_model)) {
+    lrt_row <- stats_out$lrt_place_model[2, ]
+    tibble(key   = c("lrt_placement_model_chisq", "lrt_placement_model_df", "lrt_placement_model_p"),
+           value = c(round(lrt_row[["LR.stat"]], 2), lrt_row[["df"]], lrt_row[["Pr(>Chisq)"]]))
+  } else tibble(key = c("lrt_placement_model_chisq", "lrt_placement_model_df", "lrt_placement_model_p"),
+                value = NA_real_),
+  # Detection-compliance (aware prompt)
+  tibble(
+    key = c("det_compliance_aw_detected_n", "det_compliance_aw_detected_shift",
+            "det_compliance_aw_detected_pct_up", "det_compliance_aw_undetected_n",
+            "det_compliance_aw_undetected_shift", "det_compliance_aw_undetected_pct_up",
+            "det_compliance_aw_wilcox_p"),
+    value = c(aw_det_sum$n, aw_det_sum$mean_shift, aw_det_sum$pct_up,
+              aw_undet_sum$n, aw_undet_sum$mean_shift, aw_undet_sum$pct_up,
+              det_wilcox_aware$p)
+  )
 )
 
 write.csv(text_stats, here("tables", "T_text_stats.csv"), row.names = FALSE)
@@ -1161,102 +999,7 @@ save_table(T1_dat, "T1_corpus",
     "Citations: number of times each article has been cited, as returned by the CrossRef API at time of corpus assembly. Author count: total author list length as recorded in the CrossRef metadata."
   ))
 
-# ── T2: Primary results ───────────────────────────────────────────────────────
-# One row per prompt_style × condition; Wilcoxon p-values joined from stats_out.
-
-build_primary_tbl <- function(ps_label, ps_code, include_detection = FALSE) {
-  rows <- dat |>
-    filter(prompt_style == ps_code, !is.na(recommendation)) |>
-    mutate(condition = fct_condition(as.character(direction), as.character(placement))) |>
-    group_by(condition) |>
-    summarise(
-      n_reviews   = n(),
-      rec_dist    = fmt_rec_dist(recommendation),
-      mean_ord    = mean(recommendation_ordinal, na.rm = TRUE),
-      sd_ord      = sd(recommendation_ordinal,   na.rm = TRUE),
-      delta       = mean(recommendation_ordinal, na.rm = TRUE) - baseline_mean,
-      det_n       = sum(detected_injection, na.rm = TRUE),
-      det_pct     = round(100 * mean(detected_injection, na.rm = TRUE)),
-      .groups     = "drop"
-    ) |>
-    mutate(
-      `N`                     = n_reviews,
-      `Recommendation, n (%)`  = rec_dist,
-      `Mean ordinal (SD)`      = sprintf("%.1f (%.1f)", mean_ord, sd_ord),
-      `Shift vs baseline`      = ifelse(condition == "Baseline", "\u2014",
-                                        sprintf("%+.2f", delta))
-    )
-
-  # Join p-values — one row per placement (take most conservative across models)
-  pvals <- stats_out$wilcox_primary |>
-    filter(prompt_style == ps_code) |>
-    mutate(condition = factor(
-      case_when(placement == "beginning" ~ "Beginning",
-                placement == "middle"    ~ "Middle",
-                placement == "end"       ~ "End"),
-      levels = levels(rows$condition))) |>
-    group_by(condition) |>
-    slice_min(p_adj, n = 1, with_ties = FALSE) |>
-    ungroup() |>
-    select(condition, p_fmt, stars)
-
-  rows <- left_join(rows, pvals, by = "condition") |>
-    mutate(`p-value` = ifelse(condition == "Baseline", "\u2014",
-                              ifelse(is.na(p_fmt), "—", p_fmt)))
-
-  out <- rows |> select(Condition = condition, N, `Recommendation, n (%)`,
-                         `Mean ordinal (SD)`, `Shift vs baseline`, `p-value`)
-
-  if (include_detection) {
-    out <- rows |>
-      mutate(`Detection, n (%)` = ifelse(condition == "Baseline",
-               sprintf("%d (%d%%)", det_n, det_pct),
-               sprintf("%d (%d%%)", det_n, det_pct))) |>
-      select(Condition = condition, N, `Recommendation, n (%)`,
-             `Mean ordinal (SD)`, `Shift vs baseline`,
-             `Detection, n (%)`, `p-value`)
-  }
-  out
-}
-
-T2a <- build_primary_tbl("Standard", "standard", include_detection = FALSE)
-T2b <- build_primary_tbl("Injection-aware", "aware",   include_detection = TRUE)
-
-# Rows with significant Bonferroni-adjusted p-values (exclude baseline "—")
-sig_rows_t2 <- function(tbl) {
-  pv <- tbl[["p-value"]]
-  which(pv == "<0.001" | (!is.na(suppressWarnings(as.numeric(pv))) &
-                           suppressWarnings(as.numeric(pv)) < 0.05))
-}
-
-save_table(T2a, "T2a_standard",
-  caption = "Table 2a. Reviewer recommendations by injection condition — standard prompt.",
-  hline_after = 1L,
-  bold_col  = "p-value",
-  bold_rows = sig_rows_t2(T2a),
-  footnotes = c(
-    "Ordinal scale: 1 = Reject, 2 = Major revision, 3 = Minor revision, 4 = Accept.",
-    "Shift vs baseline = difference in mean ordinal score relative to the no-injection condition.",
-    paste0("p-values from two-sided Wilcoxon rank-sum test (injection vs no-injection baseline); ",
-           "Bonferroni correction applied for three placement comparisons (adjusted threshold p < 0.017). ",
-           "Bold = statistically significant after correction.")
-  ))
-
-save_table(T2b, "T2b_aware",
-  caption = "Table 2b. Reviewer recommendations by injection condition — injection-aware prompt.",
-  hline_after = 1L,
-  bold_col  = "p-value",
-  bold_rows = sig_rows_t2(T2b),
-  footnotes = c(
-    "Ordinal scale: 1 = Reject, 2 = Major revision, 3 = Minor revision, 4 = Accept.",
-    "Shift vs baseline = difference in mean ordinal score relative to the no-injection condition.",
-    "Detection: proportion of reviews in which the reviewer explicitly identified the presence of embedded instructions.",
-    paste0("p-values from two-sided Wilcoxon rank-sum test (injection vs no-injection baseline); ",
-           "Bonferroni correction applied for three placement comparisons (adjusted threshold p < 0.017). ",
-           "Bold = statistically significant after correction.")
-  ))
-
-# ── T2 combined: side-by-side standard | aware (main publication table) ───────
+# ── T2: Primary results — side-by-side standard | aware ───────────────────────
 
 compact_side <- function(ps_code) {
   rows <- dat |>
@@ -1299,28 +1042,21 @@ compact_side <- function(ps_code) {
     select(condition, n_reviews, mean_sd, shift, det, p_val)
 }
 
-T2a_cpt <- compact_side("standard")
-T2b_cpt <- compact_side("aware")
-
-T2_combined <- T2a_cpt |>
+T2_combined <- compact_side("standard") |>
   select(-det) |>
   rename(std_N = n_reviews, std_mean = mean_sd,
-         std_shift = shift,  std_p    = p_val) |>
+         std_shift = shift, std_p = p_val) |>
   left_join(
-    T2b_cpt |>
-      rename(aw_N  = n_reviews, aw_mean  = mean_sd,
-             aw_shift = shift,  aw_det   = det,   aw_p = p_val),
+    compact_side("aware") |>
+      rename(aw_N = n_reviews, aw_mean = mean_sd,
+             aw_shift = shift, aw_det = det, aw_p = p_val),
     by = "condition"
   )
 
 write.csv(T2_combined, here("tables", "T2_primary.csv"), row.names = FALSE)
 
-sig_std_comb <- which(T2_combined$std_p == "<0.001" |
-  (!is.na(suppressWarnings(as.numeric(T2_combined$std_p))) &
-    suppressWarnings(as.numeric(T2_combined$std_p)) < 0.05))
-sig_aw_comb  <- which(T2_combined$aw_p  == "<0.001" |
-  (!is.na(suppressWarnings(as.numeric(T2_combined$aw_p))) &
-    suppressWarnings(as.numeric(T2_combined$aw_p))  < 0.05))
+sig_std_comb <- which(is_sig_p(T2_combined$std_p))
+sig_aw_comb  <- which(is_sig_p(T2_combined$aw_p))
 
 ft_t2 <- flextable::flextable(as.data.frame(T2_combined)) |>
   flextable::set_header_labels(
@@ -1366,42 +1102,34 @@ finalize_ft(ft_t2, "T2_primary",
 # ── T3: Secondary outcomes — wide format with spanning header ─────────────────
 # Rows = outcomes; columns: Outcome | Std Baseline | Std Injection | p | Aw Baseline | Aw Injection | p
 
-sec_cells <- dat |>
+# Mean (SD) cells pivoted to wide: std_bl, std_inj, aw_bl, aw_inj
+t3_cells <- dat |>
   filter(!is.na(sentiment_score)) |>
-  mutate(dir_label = ifelse(direction == "baseline", "Baseline", "Injection")) |>
-  group_by(prompt_style, dir_label) |>
-  summarise(
-    sent = sprintf("%.1f (%.1f)", mean(sentiment_score), sd(sentiment_score)),
-    crit = sprintf("%.1f (%.1f)", mean(critique_count),  sd(critique_count)),
-    str  = sprintf("%.1f (%.1f)", mean(strength_count),  sd(strength_count)),
-    .groups = "drop"
-  )
+  mutate(dir = ifelse(direction == "baseline", "bl", "inj"),
+         ps  = ifelse(prompt_style == "standard", "std", "aw")) |>
+  pivot_longer(c(sentiment_score, critique_count, strength_count),
+               names_to = "outcome", values_to = "value") |>
+  group_by(ps, dir, outcome) |>
+  summarise(cell = sprintf("%.1f (%.1f)", mean(value), sd(value)), .groups = "drop") |>
+  unite("col", ps, dir) |>
+  pivot_wider(names_from = col, values_from = cell)
 
-gcell3 <- function(ps, dir, col) {
-  r <- sec_cells |> filter(prompt_style == ps, dir_label == dir)
-  if (nrow(r) == 0) "—" else r[[col]][1]
-}
-gpval3 <- function(ps, out) {
-  r <- stats_out$wilcox_secondary |> filter(prompt_style == ps, outcome == out)
-  if (nrow(r) == 0) "—" else r$p_fmt[1]
-}
-gpadj3 <- function(ps, out) {
-  r <- stats_out$wilcox_secondary |> filter(prompt_style == ps, outcome == out)
-  if (nrow(r) == 0) 1 else r$p_adj[1]
-}
+# Attach pooled Wilcoxon p-values
+t3_pvals <- stats_out$wilcox_secondary_pooled |>
+  mutate(ps = ifelse(prompt_style == "standard", "std", "aw")) |>
+  pivot_wider(id_cols = outcome, names_from = ps,
+              values_from = c(p_fmt, p_adj), names_glue = "{ps}_{.value}") |>
+  rename(std_p = std_p_fmt, aw_p = aw_p_fmt, std_padj = std_p_adj, aw_padj = aw_p_adj)
 
-T3_wide <- data.frame(
-  Outcome  = c("Sentiment (0\u201310)", "Critiques, n", "Strengths, n"),
-  std_bl   = c(gcell3("standard","Baseline","sent"), gcell3("standard","Baseline","crit"), gcell3("standard","Baseline","str")),
-  std_inj  = c(gcell3("standard","Injection","sent"), gcell3("standard","Injection","crit"), gcell3("standard","Injection","str")),
-  std_p    = c(gpval3("standard","sentiment_score"), gpval3("standard","critique_count"), gpval3("standard","strength_count")),
-  std_padj = c(gpadj3("standard","sentiment_score"), gpadj3("standard","critique_count"), gpadj3("standard","strength_count")),
-  aw_bl    = c(gcell3("aware","Baseline","sent"), gcell3("aware","Baseline","crit"), gcell3("aware","Baseline","str")),
-  aw_inj   = c(gcell3("aware","Injection","sent"), gcell3("aware","Injection","crit"), gcell3("aware","Injection","str")),
-  aw_p     = c(gpval3("aware","sentiment_score"), gpval3("aware","critique_count"), gpval3("aware","strength_count")),
-  aw_padj  = c(gpadj3("aware","sentiment_score"), gpadj3("aware","critique_count"), gpadj3("aware","strength_count")),
-  stringsAsFactors = FALSE
-)
+T3_wide <- t3_cells |>
+  left_join(t3_pvals, by = "outcome") |>
+  mutate(Outcome = factor(outcome,
+    levels = c("sentiment_score", "critique_count", "strength_count"),
+    labels = c("Sentiment (0\u201310)", "Critiques, n", "Strengths, n")
+  )) |>
+  arrange(Outcome) |>
+  mutate(Outcome = as.character(Outcome)) |>
+  select(Outcome, std_bl, std_inj, std_p, std_padj, aw_bl, aw_inj, aw_p, aw_padj)
 
 write.csv(T3_wide |> select(-std_padj, -aw_padj),
           here("tables", "T3_secondary.csv"), row.names = FALSE)
@@ -1521,9 +1249,7 @@ if (!is.null(stats_out$clmm_place_interact_tbl)) {
 # Written to output/legends.md (consolidated) and figures/<name>.md (per figure).
 # ══════════════════════════════════════════════════════════════════════════════
 
-n_papers    <- n_distinct(dat$paper_id)
-n_extracted <- sum(!is.na(dat$recommendation))
-models_run  <- paste(unique(fct_model(dat$model_name)), collapse = ", ")
+n_papers <- n_distinct(dat$paper_id)
 
 CAPTIONS <- list(
 
