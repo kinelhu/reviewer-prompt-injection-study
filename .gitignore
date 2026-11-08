@@ -27,8 +27,17 @@ data/plos_cache/
 # Archive — old databases and generated reports
 archive/
 
-# Experiment runtime log
+# Experiment runtime logs, backups and raw batch files (raw outputs belong with the data on Zenodo)
 data/experiment.log
+data/*.log
+data/study_pre-*.db
+data/batch_input_*.jsonl
+data/batch_results_*.jsonl
+data/batch_state_*.json
+data/or_results_*.jsonl
+data/rerun_log.jsonl
+data/detection_v1/
+scripts/.r1_*
 
 # Generated outputs (reproducible from pipeline.R)
 figures/

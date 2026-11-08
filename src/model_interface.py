@@ -19,11 +19,15 @@ class OllamaModel:
     """Interface for local Ollama models."""
 
     def __init__(self, model_string: str, endpoint: str = "http://localhost:11434",
-                 temperature: float = 0.7, max_tokens: int = 2000):
+                 temperature: float = 0.7, max_tokens: int = 2000,
+                 think: Optional[bool] = None):
         self.model_string = model_string
         self.endpoint = endpoint
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # None = Ollama default (preserves the behavior of the original runs);
+        # False pins thinking off for hybrid thinking models (R1: qwen3.8).
+        self.think = think
         self.logger = logging.getLogger(__name__)
 
     def query(self, user_prompt: str, system_prompt: Optional[str] = None) -> tuple[str, dict]:
@@ -47,6 +51,8 @@ class OllamaModel:
                 "num_predict": self.max_tokens,
             },
         }
+        if self.think is not None:
+            payload["think"] = self.think
 
         try:
             response = requests.post(url, json=payload, timeout=300)
@@ -230,6 +236,7 @@ class ModelFactory:
                 endpoint=config.get("endpoint", "http://localhost:11434"),
                 temperature=config.get("temperature", 0.7),
                 max_tokens=config.get("max_tokens", 2000),
+                think=config.get("think"),
             )
         elif provider == "anthropic":
             return AnthropicModel(

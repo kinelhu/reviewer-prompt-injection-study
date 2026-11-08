@@ -18,6 +18,70 @@ models:
     reasoning_effort: medium
     max_tokens: 4000
 
+  # JMIR R1 additions (reviewer BV-1): two current-generation models,
+  # same settings as their 2025 counterparts for comparability.
+  # Thinking is pinned OFF for both R1 models (Kinan, 2026-09-12): tests a
+  # current-generation non-reasoning configuration. NOT continuity with o4-mini,
+  # which ran at reasoning_effort medium — state the asymmetry in Methods.
+  - name: gpt-5.6-luna
+    provider: openai
+    model_string: gpt-5.6-luna
+    reasoning_effort: none  # documented off-switch for gpt-5.6 chat completions
+    max_tokens: 8000        # generous ceiling; pilot review alone was ~3.3k tokens
+
+  # Within-model reasoning contrast (R1): same model, reasoning on. Runs via
+  # scripts/batch_reviews.py only — deliberately NOT in models_to_test.
+  - name: gpt-5.6-luna-medium
+    provider: openai
+    model_string: gpt-5.6-luna
+    reasoning_effort: medium
+    max_tokens: 8000
+
+  # JMIR R2 (reviewer BV): reasoning off/on contrast in a second vendor. Batch
+  # only, via scripts/batch_reviews_anthropic.py. No temperature (the API rejects
+  # it) and no refusal fallback (it would swap the model mid-experiment).
+  - name: claude-opus-5-off
+    provider: anthropic
+    model_string: claude-opus-5
+    thinking: {type: disabled}
+    effort: medium
+    max_tokens: 16000
+
+  - name: claude-opus-5-on
+    provider: anthropic
+    model_string: claude-opus-5
+    thinking: {type: adaptive}
+    effort: medium
+    max_tokens: 16000
+
+  # JMIR R2: same weights hosted on OpenRouter, one pinned host, no fallback.
+  # Run via scripts/run_openrouter_arm.py only.
+  - name: qwen3.8-27b-off
+    provider: openrouter
+    model_string: qwen/qwen3.8-27b
+    host: Chutes
+    reasoning: {enabled: false}
+    temperature: 0.7
+    max_tokens: 16000
+
+  - name: qwen3.8-27b-on
+    provider: openrouter
+    model_string: qwen/qwen3.8-27b
+    host: Chutes
+    reasoning: {enabled: true, effort: medium}
+    temperature: 0.7
+    max_tokens: 16000
+
+  - name: qwen3.8:27b
+    provider: ollama
+    model_string: qwen3.8:27b
+    endpoint: http://localhost:11434
+    temperature: 0.7
+    max_tokens: 4000
+    think: false            # hybrid thinking model; Ollama default is on
+
+# Gemma 4 26B, tag gemma4:26b, Ollama ID 5571076f3d70, weights sha256:7121486771cbfe218851513210c40b35dbdee93ab1ef43fe36283c883980f0df
+# (weights sha256 recorded 2026-11-07, JMIR BE-7)
 extractor_model:
   name: gemma4:26b
   provider: ollama
@@ -52,6 +116,10 @@ plos_api:
 experiment:
   n_runs: 1
   use_system_prompt: true
+  # Note: both gpt-5.6-luna arms run via scripts/batch_reviews.py (Batch API),
+  # never through the synchronous orchestrator — keep them out of this list.
+  # qwen3.8:27b was evaluated as an R1 candidate but NOT run (Kinan, 2026-09-14):
+  # the luna extension already answers BV-1; kept in models: for provenance only.
   models_to_test:
     - gemma4:26b
     - o4-mini

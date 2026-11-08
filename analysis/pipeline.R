@@ -190,54 +190,50 @@ is_sig_p <- function(p_str) {
 
 # ── F1: Per-paper tile chart ──────────────────────────────────────────────────
 
+# Order papers within each study type; study types ordered by sample size.
+STUDY_LEVELS <- c(rct = "RCT", systematic_review = "Systematic review",
+                  observational = "Observational")
 paper_order <- dat |>
   distinct(paper_id, study_type) |>
-  arrange(study_type, paper_id) |>
+  mutate(study_type_f = factor(STUDY_LEVELS[study_type], levels = STUDY_LEVELS)) |>
+  arrange(study_type_f, paper_id) |>
   mutate(row_idx = row_number())
-
-group_ends <- paper_order |>
-  group_by(study_type) |>
-  summarise(end_idx = max(row_idx), .groups = "drop") |>
-  filter(end_idx < max(paper_order$row_idx))
-
-study_labels <- paper_order |>
-  group_by(study_type) |>
-  summarise(mid_idx = mean(row_idx), .groups = "drop") |>
-  mutate(study_type = recode(study_type,
-    rct = "RCT", systematic_review = "Systematic\nreview",
-    observational = "Observational"))
 
 tile_dat <- dat |>
   filter(!is.na(recommendation)) |>
   left_join(paper_order, by = c("paper_id", "study_type")) |>
   mutate(prompt_long     = fct_prompt_long(as.character(prompt_style)),
-         model_f         = fct_model(model_name),
+         model_f         = droplevels(fct_model(model_name)),  # drop empty model levels (e.g. Claude Sonnet)
          condition_label = fct_condition(as.character(direction), as.character(placement)),
          rec_label       = REC_SHORT[as.character(recommendation)])
 
+# N-m2: cut the paper axis into three parts sized by sample (the reviewer's own
+# second option). Proportional row facets per study type (nested under reviewer
+# model) make the grouping unambiguously discrete rather than a continuous axis;
+# space = "free_y" sizes each block to its paper count.
 F1 <- tile_dat |>
-  ggplot(aes(x = condition_label, y = row_idx, fill = recommendation)) +
+  ggplot(aes(x = condition_label, y = factor(row_idx), fill = recommendation)) +
   geom_tile(color = "white", linewidth = 0.35) +
   geom_vline(xintercept = 1.5, color = "grey30", linewidth = 0.9) +
-  geom_hline(data = group_ends, aes(yintercept = end_idx + 0.5),
-             color = "white", linewidth = 1.2, inherit.aes = FALSE) +
-  facet_grid(model_f ~ prompt_long) +
+  facet_grid(rows = vars(model_f, study_type_f), cols = vars(prompt_long),
+             scales = "free_y", space = "free_y") +
   scale_fill_manual(values = REC_COLORS, labels = REC_LABELS) +
   scale_x_discrete(position = "top",
                    labels = c(Baseline  = "Baseline",
-                              Beginning = "Injection\n(beginning)",
-                              Middle    = "Injection\n(middle)",
-                              End       = "Injection\n(end)")) +
-  scale_y_continuous(breaks = study_labels$mid_idx,
-                     labels = study_labels$study_type, expand = c(0, 0)) +
+                              Beginning = "Beginning",
+                              Middle    = "Middle",
+                              End       = "End")) +
+  scale_y_discrete(breaks = NULL, expand = c(0, 0)) +
   labs(x = NULL, y = NULL, fill = NULL) +
   guides(fill = guide_legend(nrow = 1, override.aes = list(linewidth = 0))) +
-  theme(axis.text.y = element_text(size = 8, color = "#555555"),
-        axis.ticks.y = element_blank(),
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.text.x.top = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
         panel.grid = element_blank(), legend.position = "bottom",
-        panel.spacing.x = unit(1.2, "lines"))
+        panel.spacing.x = unit(1.2, "lines"),
+        panel.spacing.y = unit(0.25, "lines"),
+        strip.text.y.right = element_text(angle = 0, size = 8))
 
-save_fig(F1, "FS2_tiles", width = 7, height = 8)
+save_fig(F1, "FS2_tiles", width = 7.5, height = 9)
 
 # ── F2: Mean recommendation — aggregate injection vs baseline ─────────────────
 # Injection pooled across placements. X-axis: prompt style. Colour: condition.
@@ -567,7 +563,7 @@ secondary_long <- pivot_metrics(dat, secondary_cols, sec_labels, sec_count)
 secondary_paper_means <- pivot_metrics(dat, secondary_cols, sec_labels, sec_count,
                                        by_paper = TRUE)
 
-sig_f4 <- stats_out$wilcox_secondary |>
+sig_f4 <- stats_out$wilcox_secondary_paired |>
   mutate(
     prompt_f = fct_prompt(prompt_style),
     model_f  = fct_model(model_name),
@@ -725,11 +721,15 @@ if (has_psycholing) {
   psycholing_paper_means <- pivot_metrics(dat, psycholing_cols_present, psycholing_labels,
                                           by_paper = TRUE)
 
-  sig_psy <- psycholing_long |>
+  # JMIR R1: paired signed-rank on per-paper means (baseline vs injection
+  # averaged across placements), replacing the unpaired rank-sum.
+  sig_psy <- psycholing_paper_means |>
+    pivot_wider(id_cols = c(paper_id, prompt_f, model_f, metric),
+                names_from = dir_label, values_from = value) |>
+    filter(!is.na(Baseline), !is.na(Injection)) |>
     group_by(prompt_f, model_f, metric) |>
     summarise(
-      pval = wilcox.test(value[dir_label == "Baseline"],
-                         value[dir_label == "Injection"],
+      pval = wilcox.test(Injection, Baseline, paired = TRUE,
                          exact = FALSE)$p.value,
       .groups = "drop"
     ) |>
@@ -1002,6 +1002,13 @@ save_table(T1_dat, "T1_corpus",
 # ── T2: Primary results — side-by-side standard | aware ───────────────────────
 
 compact_side <- function(ps_code) {
+  # Shift is against the MATCHED same-prompt baseline (the paired comparison),
+  # not the global baseline mean pooled across prompt styles.
+  ps_baseline <- dat |>
+    filter(prompt_style == ps_code, direction == "baseline",
+           !is.na(recommendation_ordinal)) |>
+    pull(recommendation_ordinal) |>
+    mean()
   rows <- dat |>
     filter(prompt_style == ps_code, !is.na(recommendation)) |>
     mutate(condition = fct_condition(as.character(direction),
@@ -1011,7 +1018,7 @@ compact_side <- function(ps_code) {
       n_reviews = n(),
       mean_ord  = mean(recommendation_ordinal, na.rm = TRUE),
       sd_ord    = sd(recommendation_ordinal,   na.rm = TRUE),
-      delta     = mean(recommendation_ordinal, na.rm = TRUE) - baseline_mean,
+      delta     = mean(recommendation_ordinal, na.rm = TRUE) - ps_baseline,
       det_n     = sum(detected_injection, na.rm = TRUE),
       det_pct   = round(100 * mean(detected_injection, na.rm = TRUE)),
       .groups   = "drop"
@@ -1114,8 +1121,8 @@ t3_cells <- dat |>
   unite("col", ps, dir) |>
   pivot_wider(names_from = col, values_from = cell)
 
-# Attach pooled Wilcoxon p-values
-t3_pvals <- stats_out$wilcox_secondary_pooled |>
+# Attach pooled paired Wilcoxon p-values (JMIR R1: signed-rank, paired by paper × model)
+t3_pvals <- stats_out$wilcox_secondary_pooled_paired |>
   mutate(ps = ifelse(prompt_style == "standard", "std", "aw")) |>
   pivot_wider(id_cols = outcome, names_from = ps,
               values_from = c(p_fmt, p_adj), names_glue = "{ps}_{.value}") |>
@@ -1165,7 +1172,8 @@ if (requireNamespace("flextable", quietly = TRUE) && requireNamespace("officer",
       paste0("Sentiment scored 0 (maximally harsh or dismissive) to 10 (maximally enthusiastic or positive). ",
              "Critiques: number of distinct methodological weaknesses raised. ",
              "Strengths: number of distinct positive aspects identified."),
-      paste0("p-values from two-sided Wilcoxon rank-sum test (injection vs baseline, pooled), ",
+      paste0("p-values from two-sided paired Wilcoxon signed-rank test (injection vs baseline, ",
+             "paired by paper \u00d7 model, injection averaged across placements), ",
              "Bonferroni-adjusted for 3 outcomes \u00d7 2 prompt styles (6 comparisons). ",
              "Bold = p < 0.05 after correction.")
     ))
@@ -1264,7 +1272,7 @@ CAPTIONS <- list(
     n_papers),
 
   F2F3_panel = paste0(
-    "**Figure 2. Primary outcomes of adversarial prompt injection.**\n",
+    "**Figure 2. Primary outcomes of prompt injection.**\n",
     "**A** Mean reviewer recommendation (ordinal 1\u20134; 95%\u2009CI) by prompt style (x-axis) ",
     "and condition (Baseline vs.\u2009pooled injection across placements). ",
     "Shape encodes LLM reviewer model. ",
@@ -1300,7 +1308,8 @@ CAPTIONS <- list(
     "Boxes span the interquartile range of all reviews; whiskers extend to 1.5\u2009\u00d7\u2009IQR. ",
     "Points represent per-paper mean values (averaged across placements), ",
     "with shape encoding the reviewer model. ",
-    "Asterisks: unpaired Wilcoxon rank-sum test (injection vs.\u2009baseline, placements pooled); ",
+    "Asterisks: paired Wilcoxon signed-rank test (injection vs.\u2009baseline, paired by paper, ",
+    "injection averaged across placements), Bonferroni-corrected; ",
     "\\*p\u2009<\u20090.05, \\*\\*p\u2009<\u20090.01, \\*\\*\\*p\u2009<\u20090.001, ns\u2009=\u2009not significant."),
 
   F1_alluvial = paste0(
@@ -1320,7 +1329,8 @@ CAPTIONS <- list(
     "**C** Assertiveness. **D** Certainty ",
     "(zero-shot NLI classifier, cross-encoder/nli-MiniLM2-L6-H768). ",
     "Boxes span the IQR of all reviews; points are per-paper means. ",
-    "Asterisks: unpaired Wilcoxon rank-sum test; ",
+    "Asterisks: paired Wilcoxon signed-rank test on per-paper means ",
+    "(injection vs. baseline); ",
     "\\*p\u2009<\u20090.05, \\*\\*p\u2009<\u20090.01, \\*\\*\\*p\u2009<\u20090.001, ns\u2009=\u2009not significant."
   ) else NULL,
 
@@ -1344,3 +1354,130 @@ n_figs <- length(list.files(here("figures"), pattern = "\\.pdf$"))
 n_tabs <- length(list.files(here("tables"),  pattern = "\\.(docx|csv)$"))
 cat(sprintf("Done.\n  %d figures -> figures/\n  %d tables  -> tables/\n  Legends    -> output/legends.md\n",
             n_figs, n_tabs))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 ADDITIONAL ANALYSES (JMIR ms#101182 revision)
+# Writes output/r1_additional.md — the response letter reads its numbers from
+# this file; nothing below is retyped into prose.
+# ══════════════════════════════════════════════════════════════════════════════
+
+r1 <- c("# R1 additional analyses", "",
+        sprintf("Generated by pipeline.R on %s from data/study.db.", Sys.Date()), "")
+
+# ── Review length: mean (SD), median (IQR), normality (reviewer N-3) ──────────
+
+rev_len <- dat |>
+  mutate(len = lengths(strsplit(full_review_text, "\\s+"))) |>
+  group_by(model_name) |>
+  summarise(
+    n = n(), mean = mean(len), sd = sd(len),
+    median = median(len), q1 = quantile(len, .25), q3 = quantile(len, .75),
+    shapiro_p = shapiro.test(len)$p.value, .groups = "drop"
+  )
+
+r1 <- c(r1, "## Review length (words) by model (N-3)", "",
+  sprintf("- %s: n=%d, mean %.0f (SD %.0f), median %.0f (IQR %.0f-%.0f), Shapiro-Wilk p=%s",
+          rev_len$model_name, rev_len$n, rev_len$mean, rev_len$sd,
+          rev_len$median, rev_len$q1, rev_len$q3, fmt_p(rev_len$shapiro_p)),
+  "")
+
+# ── Secondary outcomes: unpaired (submitted) vs paired (R1) p-values ──────────
+
+sec_cmp <- stats_out$wilcox_secondary_pooled |>
+  select(outcome, prompt_style, p_adj_unpaired = p_adj) |>
+  left_join(stats_out$wilcox_secondary_pooled_paired |>
+              select(outcome, prompt_style, n_pairs, p_adj_paired = p_adj),
+            by = c("outcome", "prompt_style"))
+
+r1 <- c(r1, "## Secondary outcomes: pooled Bonferroni-adjusted p, unpaired vs paired (BE-3, BX-4)", "",
+  "| Outcome | Prompt | p_adj rank-sum (submitted) | p_adj signed-rank (R1, n pairs) |",
+  "|---|---|---|---|",
+  sprintf("| %s | %s | %s | %s (n=%d) |",
+          sec_cmp$outcome, sec_cmp$prompt_style,
+          fmt_p(sec_cmp$p_adj_unpaired), fmt_p(sec_cmp$p_adj_paired), sec_cmp$n_pairs),
+  "")
+
+# ── Publication-year sensitivity (BV-3 training-data contamination) ───────────
+# Contamination would predict a different injection effect in papers likely
+# inside the reviewers' training data (older) vs after their cutoffs (2026).
+
+year_shift <- paired |>
+  left_join(distinct(dat, paper_id, year), by = "paper_id") |>
+  group_by(paper_id, year, prompt_style) |>
+  summarise(mean_shift = mean(shift), .groups = "drop")
+
+year_tests <- year_shift |>
+  group_by(prompt_style) |>
+  summarise(
+    rho = cor.test(mean_shift, year, method = "spearman", exact = FALSE)$estimate,
+    p   = cor.test(mean_shift, year, method = "spearman", exact = FALSE)$p.value,
+    .groups = "drop"
+  )
+
+year_bins <- year_shift |>
+  mutate(bin = cut(year, c(-Inf, 2024, 2025, Inf),
+                   labels = c("2020-2024", "2025", "2026"))) |>
+  group_by(prompt_style, bin) |>
+  summarise(n_papers = n(), sd = sd(mean_shift), mean_shift = mean(mean_shift),
+            .groups = "drop")
+
+r1 <- c(r1, "## Injection effect by publication year (BV-3)", "",
+  "Per-paper mean ordinal shift (models and placements pooled within prompt style).", "",
+  sprintf("- %s prompt: Spearman rho=%.3f, p=%s",
+          year_tests$prompt_style, year_tests$rho, fmt_p(year_tests$p)),
+  "",
+  "| Prompt | Year bin | Papers | Mean shift (SD) |",
+  "|---|---|---|---|",
+  sprintf("| %s | %s | %d | %.2f (%.2f) |",
+          year_bins$prompt_style, year_bins$bin, year_bins$n_papers,
+          year_bins$mean_shift, year_bins$sd),
+  "")
+
+# ── Corpus screen for pre-existing directives / hidden characters (N-m1) ──────
+
+corpus_50 <- papers |> semi_join(distinct(dat, paper_id), by = "paper_id")
+directive_rx <- paste0(
+  "(?i)note (for|to) (the )?reviewer|dear reviewer|your recommendation",
+  "|ignore (all |any )?(previous|prior|above)|you must recommend",
+  "|recommend accept|as an ai|system prompt"
+)
+hidden_rx <- "[\\x{200B}\\x{200C}\\x{200D}\\x{2060}\\x{FEFF}]"
+
+corpus_screen <- corpus_50 |>
+  mutate(
+    directive_hit = grepl(directive_rx, full_text, perl = TRUE),
+    hidden_hit    = grepl(hidden_rx, full_text, perl = TRUE)
+  )
+
+r1 <- c(r1, "## Corpus screen for pre-existing injections (N-m1)", "",
+  sprintf("- Papers screened: %d", nrow(corpus_screen)),
+  sprintf("- Directive-pattern hits: %d", sum(corpus_screen$directive_hit)),
+  sprintf("- Hidden/zero-width character hits: %d", sum(corpus_screen$hidden_hit)),
+  if (any(corpus_screen$directive_hit | corpus_screen$hidden_hit)) {
+    sprintf("  - flagged DOI: %s",
+            corpus_screen$doi[corpus_screen$directive_hit | corpus_screen$hidden_hit])
+  } else "- No paper carried directive-style text or hidden characters.",
+  "")
+
+# ── Corpus descriptives verified against DB (BE-1 reconciliation) ─────────────
+
+corpus_desc <- corpus_50 |>
+  summarise(min_wc = min(word_count), max_wc = max(word_count),
+            median_wc = median(word_count),
+            min_year = min(year), max_year = max(year))
+
+r1 <- c(r1, "## Corpus descriptives from DB (BE-1)", "",
+  sprintf("- Word count: median %.0f, range %d-%d (manuscript stated median ~6,300, range 4,134-8,998: correct to these values)",
+          corpus_desc$median_wc, corpus_desc$min_wc, corpus_desc$max_wc),
+  sprintf("- Publication years: %d-%d (manuscript stated 2020-2025: correct to these values)",
+          corpus_desc$min_year, corpus_desc$max_year),
+  paste0("- Study types: ",
+         paste(sprintf("%s n=%d", names(table(corpus_50$study_type)),
+                       as.integer(table(corpus_50$study_type))), collapse = ", ")),
+  "")
+
+writeLines(r1, here("output", "r1_additional.md"))
+cat("  R1 stats   -> output/r1_additional.md\n")
+
+# R1 extension analysis (2026 luna arms) — runs on dat_all, leaves primary intact
+source(here("analysis", "extension_2026.R"))

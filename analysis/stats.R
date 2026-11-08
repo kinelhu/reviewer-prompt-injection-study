@@ -123,6 +123,70 @@ wilcox_secondary_pooled <- bind_rows(lapply(
     stars = pstar(p_adj)
   )
 
+# ── 2b. Secondary outcomes: paired Wilcoxon signed-rank (R1) ──────────────────
+# JMIR R1 (reviewers BE-3, BX-4): the design pairs injection and baseline by
+# paper, so signed-rank replaces rank-sum for reporting. Pair = paper within
+# model × prompt_style; injection value = mean over the three placements
+# (baseline has exactly one review per paper × model × prompt_style).
+# The rank-sum frames above are retained so the response letter can show both.
+
+wilcox_secondary_paired <- bind_rows(lapply(
+  c("sentiment_score", "critique_count", "strength_count"),
+  function(outcome) {
+    bind_rows(lapply(models_in_data, function(mn) {
+      bind_rows(lapply(c("standard", "aware"), function(ps) {
+        bl <- dat |>
+          filter(model_name == mn, prompt_style == ps, direction == "baseline",
+                 !is.na(.data[[outcome]])) |>
+          select(paper_id, bl_val = all_of(outcome))
+        inj <- dat |>
+          filter(model_name == mn, prompt_style == ps, direction == "favorable",
+                 !is.na(.data[[outcome]])) |>
+          group_by(paper_id) |>
+          summarise(inj_val = mean(.data[[outcome]]), .groups = "drop")
+        paired_df <- inner_join(bl, inj, by = "paper_id")
+        if (nrow(paired_df) < 3) return(NULL)
+        test <- wilcox.test(paired_df$inj_val, paired_df$bl_val,
+                            paired = TRUE, exact = FALSE, alternative = "two.sided")
+        data.frame(outcome = outcome, model_name = mn, prompt_style = ps,
+                   n_pairs = nrow(paired_df),
+                   V = as.numeric(test$statistic), p_raw = test$p.value,
+                   stringsAsFactors = FALSE)
+      }))
+    }))
+  }
+)) |>
+  mutate(p_adj = p.adjust(p_raw, method = "bonferroni"),
+         p_fmt = fmt_p(p_adj), stars = pstar(p_adj))
+
+# Pooled across models: pair = paper × model within prompt_style.
+wilcox_secondary_pooled_paired <- bind_rows(lapply(
+  c("sentiment_score", "critique_count", "strength_count"),
+  function(outcome) {
+    bind_rows(lapply(c("standard", "aware"), function(ps) {
+      bl <- dat |>
+        filter(prompt_style == ps, direction == "baseline",
+               !is.na(.data[[outcome]])) |>
+        select(paper_id, model_name, bl_val = all_of(outcome))
+      inj <- dat |>
+        filter(prompt_style == ps, direction == "favorable",
+               !is.na(.data[[outcome]])) |>
+        group_by(paper_id, model_name) |>
+        summarise(inj_val = mean(.data[[outcome]]), .groups = "drop")
+      paired_df <- inner_join(bl, inj, by = c("paper_id", "model_name"))
+      if (nrow(paired_df) < 3) return(NULL)
+      test <- wilcox.test(paired_df$inj_val, paired_df$bl_val,
+                          paired = TRUE, exact = FALSE, alternative = "two.sided")
+      data.frame(outcome = outcome, prompt_style = ps,
+                 n_pairs = nrow(paired_df),
+                 V = as.numeric(test$statistic), p_raw = test$p.value,
+                 stringsAsFactors = FALSE)
+    }))
+  }
+)) |>
+  mutate(p_adj = p.adjust(p_raw, method = "bonferroni"),
+         p_fmt = fmt_p(p_adj), stars = pstar(p_adj))
+
 # ── 3. clmm — primary model (H1 and H4) ──────────────────────────────────────
 # model_name added as fixed effect when >1 model present.
 
@@ -245,6 +309,8 @@ stats_out <- list(
   wilcox_primary          = wilcox_primary,
   wilcox_secondary        = wilcox_secondary,
   wilcox_secondary_pooled = wilcox_secondary_pooled,
+  wilcox_secondary_paired        = wilcox_secondary_paired,
+  wilcox_secondary_pooled_paired = wilcox_secondary_pooled_paired,
   clmm_main               = clmm_main,
   clmm_place              = clmm_place,
   clmm_main_tbl           = clmm_main_tbl,

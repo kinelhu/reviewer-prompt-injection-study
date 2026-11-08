@@ -53,8 +53,18 @@ if (!is.null(psycholing)) {
               sum(!is.na(dat$sent_positive)), nrow(dat)))
 }
 
+# JMIR R1: the DB now also holds the 2026 extension arms (gpt-5.6-luna,
+# gpt-5.6-luna-medium). The primary analysis is the two ORIGINAL models the
+# reviewers saw; `dat` is scoped to them so every original exhibit reproduces
+# unchanged. `dat_all` keeps all arms for the extension analysis.
+PRIMARY_MODELS <- c("gemma4:26b", "o4-mini")
+dat_all <- dat
+dat <- dat |> filter(model_name %in% PRIMARY_MODELS)
+
 cat(sprintf("Loaded %d extractions across %d papers, %d conditions, %d models\n",
-            nrow(dat),
-            n_distinct(dat$paper_id),
-            n_distinct(dat$condition_id),
-            n_distinct(dat$model_name)))
+            nrow(dat_all),
+            n_distinct(dat_all$paper_id),
+            n_distinct(dat_all$condition_id),
+            n_distinct(dat_all$model_name)))
+cat(sprintf("  Primary analysis scoped to %d models (%s): %d rows\n",
+            length(PRIMARY_MODELS), paste(PRIMARY_MODELS, collapse = ", "), nrow(dat)))
