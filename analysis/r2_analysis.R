@@ -9,7 +9,7 @@ DET <- Sys.getenv("R2_DET", "extractor")   # Deviation 1: extractor detection. "
 OUT <- file.path("output", if (SCOPE != "all") "r2_test" else if (DET == "detector") "r2_detector" else "r2"); dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
 B <- 10000L
 ARMS <- tribble(~arm, ~llm, ~setting, ~main, ~contrast,
-  "gemma4:26b", "Gemma 4 26B", "Ollama default", TRUE, NA,
+  "gemma4:26b", "Gemma 4 26B", "Default", TRUE, NA,
   "o4-mini", "GPT o4-mini", "Medium", TRUE, NA,
   "gpt-5.6-luna", "GPT-5.6-luna", "Off", FALSE, "off",
   "gpt-5.6-luna-medium", "GPT-5.6-luna", "Medium", TRUE, "on",
